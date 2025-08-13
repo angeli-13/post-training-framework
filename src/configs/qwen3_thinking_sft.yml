@@ -1,0 +1,30 @@
+base_model: /work/HHRI-AI/POC/public/pretraining_weights/Alibaba-Qwen/qwen3/Qwen3-4B-Thinking-2507
+trust_remote_code: true
+chat_template: tokenizer_default
+datasets:
+- path: /work/HHRI-AI/POC/angela/post-training-framework/data/chunk1-merged.jsonl
+  type: chat_template
+  roles_to_train:
+  - assistant
+  train_on_eos: turn
+dataset_prepared_path: last_run_prepared
+val_set_size: 0.02
+sequence_len: 2048
+sample_packing: true
+eval_sample_packing: false
+pad_to_sequence_len: true
+micro_batch_size: 2
+gradient_accumulation_steps: 4
+num_epochs: 3
+learning_rate: 0.0002
+lr_scheduler: cosine
+warmup_ratio: 0.03
+gradient_checkpointing: true
+gradient_checkpointing_kwargs:
+  use_reentrant: false
+bf16: true
+output_dir: outputs/qwen3-sft
+special_tokens:
+  pad_token: <|end_of_text|>
+wandb_project: hhri-foxbrain
+wandb_name: qwen3-sft-run1
