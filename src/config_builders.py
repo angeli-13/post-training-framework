@@ -1,45 +1,64 @@
 #!/usr/bin/env python3
 """
-Generate an Axolotl YAML configuration for supervised fine-tuning (SFT).
+Axolotl config generators with shared, composable defaults.
 
-This script focuses on chat-style datasets (OpenAI messages format) and
-produces a config you can pass directly to:
+Design
+------
+A small OO hierarchy maximizes reuse while keeping comments and behavior self-contained:
 
-    axolotl train <generated.yml>
+Classes
+  BaseConfigBuilder   : Builds algorithm-agnostic fields (model, tokenizer/chat, IO, dtype, W&B, resume, adapters).
+  SFTConfigBuilder    : Adds SFT-specific dataset block.
+  DPOConfigBuilder    : Adds preference-training dataset block and TRL params for DPO.
+  GRPOConfigBuilder   : Adds RL-specific dataset transform and TRL (GRPO) block.
 
-What it does for you
-- Sets sane defaults for Qwen3-4B-Instruct-2507
-- Uses tokenizer chat template by default (keeps training + inference aligned)
-- Enables LoRA or QLoRA when requested, or full fine-tuning
-- Masks non-assistant turns during training
-- Supports resuming from a checkpoint
-- Supports Weights & Biases (W&B) project/run configuration
+Why a single file right now?
+- The classes share constants (MODEL_DEFAULTS) and helpers (model-key resolution, YAML writer).
+- Co-locating avoids duplication and keeps field ordering predictable. If this grows, it can be refactored
+  into a small package (builders/base.py, sft.py, dpo.py, grpo.py, common.py) without changing the public CLI.
 
-Example
--------
-python gen_axolotl_config.py \
-  --base_model Qwen/Qwen3-4B-Instruct-2507 \
-  --dataset_path /data/my_conversations.jsonl \
-  --output_path qwen3_sft.yml \
-  --adapter qlora \
-  --output_dir outputs/qwen3-sft \
-  --sequence_len 8192 \
-  --micro_batch_size 2 \
-  --gradient_accumulation_steps 4 \
-  --num_epochs 3 \
-  --wandb_project hhri-foxbrain \
-  --wandb_name qwen3-sft-run1
+Usage examples
+--------------
+SFT:
+  python config_builders.py sft \
+    --base_model /work/.../Qwen3-4B-Thinking-2507 \
+    --dataset_path /data/chunk1-merged.jsonl \
+    --output_path qwen3_thinking_sft.yml \
+    --adapter full \
+    --output_dir outputs/qwen3-sft \
+    --sequence_len 2048 \
+    --micro_batch_size 2 \
+    --gradient_accumulation_steps 4 \
+    --num_epochs 3 \
+    --wandb_project hhri-foxbrain \
+    --wandb_name qwen3-sft-run1
 
-Then run:
-  axolotl train qwen3_sft.yml
+DPO (Argilla-style pairwise):
+  python config_builders.py dpo \
+    --base_model /work/.../Qwen3-4B-Instruct-2507 \
+    --dataset_path /data/dpo_pairs.jsonl \
+    --output_path qwen3_dpo.yml \
+    --output_dir outputs/qwen3-dpo \
+    --sequence_len 4096 \
+    --micro_batch_size 2 \
+    --gradient_accumulation_steps 8 \
+    --trl_beta 0.1 \
+    --dpo_label_smoothing 0.0
 
-Notes
------
-- Your dataset should be JSONL with entries like:
-  {"messages": [{"role": "user", "content": "Hi"}, {"role": "assistant", "content": "Hello!"}]}
-- The config will train only on assistant turns.
-- If your base_model is a local path, pass --model_key to select which defaults to apply
-  (or rely on auto-detection that matches known model names inside the path).
+GRPO:
+  python config_builders.py grpo \
+    --base_model /work/.../Qwen3-4B-Instruct-2507 \
+    --dataset_path /data/grpo.jsonl \
+    --output_path qwen3_grpo.yml \
+    --output_dir outputs/qwen3-grpo \
+    --sequence_len 4096 \
+    --micro_batch_size 1 \
+    --gradient_accumulation_steps 8 \
+    --trl_num_generations 8 \
+    --trl_max_completion_length 256 \
+    --trl_reward_funcs rewards.model_helpfulness_reward,rewards.think_format_reward \
+    --trl_reward_weights 1.0,0.2
+
 """
 from __future__ import annotations
 
@@ -49,30 +68,24 @@ from typing import Any, Dict, List, Optional
 
 import yaml
 
-# Per-model tweaks and safe defaults
+# ---------------------------------------------------------------------------
+# Model defaults and helpers
+# ---------------------------------------------------------------------------
 MODEL_DEFAULTS: Dict[str, Dict[str, Any]] = {
-    # Qwen3-4B-Instruct-2507 specifics
+    # Instruct variant — canonical tokenizer pad token
     "Qwen/Qwen3-4B-Instruct-2507": {
-        # Use tokenizer chat template shipped with the model
         "chat_template": "tokenizer_default",
-        # Explicit special tokens for this model family (per HF tokenizer_config)
-        "special_tokens": {
-            "pad_token": "<|endoftext|>",
-        },
-        # Some Qwen variants rely on custom tokenizer classes in transformers
+        "special_tokens": {"pad_token": "<|endoftext|>"},
         "trust_remote_code": True,
-        # A good starting set of LoRA targets for Qwen-family models
         "lora_target_modules": [
             "q_proj", "k_proj", "v_proj", "o_proj",
             "gate_proj", "up_proj", "down_proj",
         ],
     },
-    # Qwen3-4B-Thinking-2507 specifics (same tokenizer + tokens; thinking chat template)
+    # Thinking variant — canonical tokenizer pad token
     "Qwen/Qwen3-4B-Thinking-2507": {
         "chat_template": "tokenizer_default",
-        "special_tokens": {
-            "pad_token": "<|endoftext|>",
-        },
+        "special_tokens": {"pad_token": "<|endoftext|>"},
         "trust_remote_code": True,
         "lora_target_modules": [
             "q_proj", "k_proj", "v_proj", "o_proj",
@@ -85,8 +98,8 @@ MODEL_DEFAULTS: Dict[str, Dict[str, Any]] = {
 def resolve_model_key(base_model: str, explicit: Optional[str]) -> Optional[str]:
     """Return a known model key for defaults.
 
-    Tries, in order: explicit value, exact match, substring match on the
-    last path component of known keys inside the provided base_model string.
+    Tries, in order: explicit value, exact match, substring match on the last
+    path component of known keys inside the provided base_model string.
     """
     if explicit:
         return explicit
@@ -100,317 +113,372 @@ def resolve_model_key(base_model: str, explicit: Optional[str]) -> Optional[str]
     return None
 
 
-def build_base_config(
-    base_model: str,
-    dataset_path: str,
-    output_dir: str,
-    sequence_len: int = 4096,
-    micro_batch_size: int = 1,
-    gradient_accumulation_steps: int = 1,
-    num_epochs: int = 3,
-    learning_rate: float = 2e-4,
-    warmup_ratio: float = 0.03,
-    val_set_size: float = 0.02,
-    run_name: Optional[str] = None,
-    chat_template: Optional[str] = None,
-    model_key: Optional[str] = None,
-    resume_from_checkpoint: Optional[str] = None,
-    auto_resume_from_checkpoints: Optional[bool] = None,
-    # W&B
-    wandb_project: Optional[str] = None,
-    wandb_entity: Optional[str] = None,
-    wandb_name: Optional[str] = None,
-    wandb_run_id: Optional[str] = None,
-    wandb_mode: Optional[str] = None,
-    wandb_watch: Optional[str] = None,
-    wandb_log_model: Optional[str] = None,
-    wandb_tags: Optional[List[str]] = None,
-) -> Dict[str, Any]:
-    """Create the common portion of the Axolotl config.
+# ---------------------------------------------------------------------------
+# Base builder
+# ---------------------------------------------------------------------------
+class BaseConfigBuilder:
+    """Build algorithm-agnostic Axolotl config sections.
 
-    Parameters
-    ----------
-    base_model : str
-        Hugging Face model id or local path.
-    dataset_path : str
-        Path to JSONL dataset in messages/role/content format.
-    output_dir : str
-        Directory for checkpoints and final artifacts.
-    sequence_len : int
-        Max packed sequence length used for training and eval.
-    micro_batch_size : int
-        Per-device micro batch size.
-    gradient_accumulation_steps : int
-        Accumulation steps to reach effective batch size.
-    num_epochs : int
-        Number of training epochs.
-    learning_rate : float
-        Optimizer learning rate (AdamW family).
-    warmup_ratio : float
-        Proportion of total steps used for warmup.
-    val_set_size : float
-        Fraction to hold out for validation.
-    run_name : str | None
-        Optional experiment name for tracking (W&B etc.).
-    chat_template : str | None
-        Optional override for chat template (defaults to tokenizer_default for known models).
-    model_key : str | None
-        Which model defaults to apply when base_model is a path.
-    resume_from_checkpoint : str | None
-        If provided, Axolotl will resume training from this checkpoint directory.
-    auto_resume_from_checkpoints : bool | None
-        If True and resume_from_checkpoint is not set, Axolotl will try to pick up the latest
-        checkpoint in the output_dir automatically.
-    W&B fields
-        wandb_project, wandb_entity, wandb_name, wandb_run_id, wandb_mode, wandb_watch,
-        wandb_log_model, wandb_tags
+    Subclasses should call `build_base()` then mutate the returned dict.
     """
-    model_defaults = MODEL_DEFAULTS.get(model_key or base_model, {})
 
-    config: Dict[str, Any] = {
-        "base_model": base_model,
-        # Keep tokenizer/model-specific behavior available when needed
-        "trust_remote_code": bool(model_defaults.get("trust_remote_code", False)),
+    def __init__(
+        self,
+        base_model: str,
+        dataset_path: str,
+        output_dir: str,
+        sequence_len: int = 4096,
+        micro_batch_size: int = 1,
+        gradient_accumulation_steps: int = 1,
+        num_epochs: int = 3,
+        learning_rate: float = 2e-4,
+        warmup_ratio: float = 0.03,
+        val_set_size: float = 0.02,
+        run_name: Optional[str] = None,
+        chat_template: Optional[str] = None,
+        model_key: Optional[str] = None,
+        resume_from_checkpoint: Optional[str] = None,
+        auto_resume_from_checkpoints: Optional[bool] = None,
+        # W&B
+        wandb_project: Optional[str] = None,
+        wandb_entity: Optional[str] = None,
+        wandb_name: Optional[str] = None,
+        wandb_run_id: Optional[str] = None,
+        wandb_mode: Optional[str] = None,
+        wandb_watch: Optional[str] = None,
+        wandb_log_model: Optional[str] = None,
+        wandb_tags: Optional[List[str]] = None,
+        # Adapters (shared across SFT and GRPO)
+        adapter: str = "full",
+        lora_r: int = 16,
+        lora_alpha: int = 16,
+        lora_dropout: float = 0.05,
+        lora_target_modules: Optional[List[str]] = None,
+    ):
+        self.base_model = base_model
+        self.dataset_path = dataset_path
+        self.output_dir = output_dir
+        self.sequence_len = sequence_len
+        self.micro_batch_size = micro_batch_size
+        self.gradient_accumulation_steps = gradient_accumulation_steps
+        self.num_epochs = num_epochs
+        self.learning_rate = learning_rate
+        self.warmup_ratio = warmup_ratio
+        self.val_set_size = val_set_size
+        self.run_name = run_name
+        self.chat_template = chat_template
+        self.model_key = model_key
+        self.resume_from_checkpoint = resume_from_checkpoint
+        self.auto_resume_from_checkpoints = auto_resume_from_checkpoints
+        # W&B
+        self.wandb_project = wandb_project
+        self.wandb_entity = wandb_entity
+        self.wandb_name = wandb_name
+        self.wandb_run_id = wandb_run_id
+        self.wandb_mode = wandb_mode
+        self.wandb_watch = wandb_watch
+        self.wandb_log_model = wandb_log_model
+        self.wandb_tags = wandb_tags
+        # Adapters
+        self.adapter = (adapter or "full").lower()
+        self.lora_r = lora_r
+        self.lora_alpha = lora_alpha
+        self.lora_dropout = lora_dropout
+        self.lora_target_modules = lora_target_modules
 
-        # Use tokenizer chat template, or a given template like "chatml"/"gemma"/etc.
-        "chat_template": chat_template or model_defaults.get("chat_template", "tokenizer_default"),
+    def build_base(self) -> Dict[str, Any]:
+        mdef = MODEL_DEFAULTS.get(self.model_key or self.base_model, {})
+        cfg: Dict[str, Any] = {
+            "base_model": self.base_model,
+            "trust_remote_code": bool(mdef.get("trust_remote_code", False)),
+            "chat_template": self.chat_template or mdef.get("chat_template", "tokenizer_default"),
+            "datasets": [  # subclasses override `type` and dataset specifics
+                {
+                    "path": self.dataset_path,
+                    "type": "chat_template",
+                }
+            ],
+            "dataset_prepared_path": "last_run_prepared",
+            "val_set_size": self.val_set_size,
+            "sequence_len": self.sequence_len,
+            "sample_packing": True,
+            "eval_sample_packing": False,
+            "pad_to_sequence_len": True,
+            "micro_batch_size": self.micro_batch_size,
+            "gradient_accumulation_steps": self.gradient_accumulation_steps,
+            "num_epochs": self.num_epochs,
+            "learning_rate": self.learning_rate,
+            "lr_scheduler": "cosine",
+            "warmup_ratio": self.warmup_ratio,
+            "gradient_checkpointing": True,
+            "gradient_checkpointing_kwargs": {"use_reentrant": False},
+            "bf16": True,
+            "output_dir": self.output_dir,
+        }
+        # Attach model-specific special tokens when known
+        if "special_tokens" in mdef:
+            cfg["special_tokens"] = mdef["special_tokens"]
+        # Optional W&B
+        if self.wandb_project:
+            cfg["wandb_project"] = self.wandb_project
+        if self.wandb_entity:
+            cfg["wandb_entity"] = self.wandb_entity
+        if self.wandb_name:
+            cfg["wandb_name"] = self.wandb_name
+        if self.wandb_run_id:
+            cfg["wandb_run_id"] = self.wandb_run_id
+        if self.wandb_mode:
+            cfg["wandb_mode"] = self.wandb_mode
+        if self.wandb_watch:
+            cfg["wandb_watch"] = self.wandb_watch
+        if self.wandb_log_model:
+            cfg["wandb_log_model"] = self.wandb_log_model
+        if self.wandb_tags:
+            cfg["wandb_tags"] = list(self.wandb_tags)
+        # Resume
+        if self.resume_from_checkpoint:
+            cfg["resume_from_checkpoint"] = str(self.resume_from_checkpoint)
+        if self.auto_resume_from_checkpoints is not None:
+            cfg["auto_resume_from_checkpoints"] = bool(self.auto_resume_from_checkpoints)
+        # Adapters shared across algorithms
+        self._apply_adapter(cfg, mdef)
+        return cfg
 
-        # Dataset section: chat-style conversations, mask training to assistant turns
-        "datasets": [
-            {
-                "path": dataset_path,
-                "type": "chat_template",
-                "roles_to_train": ["assistant"],
-                # Train on EOS at each assistant turn boundary
-                "train_on_eos": "turn",
-            }
-        ],
-        # Cache pre-tokenized dataset here if you call `axolotl preprocess`
-        "dataset_prepared_path": "last_run_prepared",
+    def _apply_adapter(self, cfg: Dict[str, Any], mdef: Dict[str, Any]) -> None:
+        """Attach LoRA/QLoRA configuration if requested.
 
-        # Eval split size if you are not supplying explicit test_datasets
-        "val_set_size": val_set_size,
-
-        # Training + packing
-        "sequence_len": sequence_len,
-        "sample_packing": True,
-        "eval_sample_packing": False,
-        "pad_to_sequence_len": True,
-
-        # Core training hyperparameters
-        "micro_batch_size": micro_batch_size,
-        "gradient_accumulation_steps": gradient_accumulation_steps,
-        "num_epochs": num_epochs,
-        "learning_rate": learning_rate,
-        "lr_scheduler": "cosine",
-        "warmup_ratio": warmup_ratio,
-        "gradient_checkpointing": True,
-        "gradient_checkpointing_kwargs": {"use_reentrant": False},
-
-        # dtype and output
-        "bf16": True,
-        "output_dir": output_dir,
-    }
-
-    # Attach model-specific special tokens when known
-    if "special_tokens" in model_defaults:
-        config["special_tokens"] = model_defaults["special_tokens"]
-
-    # Run name for trackers like W&B (optional)
-    if run_name:
-        config["wandb_name"] = run_name
-
-    # Checkpoint resume controls
-    if resume_from_checkpoint:
-        config["resume_from_checkpoint"] = str(resume_from_checkpoint)
-    if auto_resume_from_checkpoints is not None:
-        config["auto_resume_from_checkpoints"] = bool(auto_resume_from_checkpoints)
-
-    # W&B block (added only if provided)
-    if wandb_project:
-        config["wandb_project"] = wandb_project
-    if wandb_entity:
-        config["wandb_entity"] = wandb_entity
-    if wandb_name:
-        config["wandb_name"] = wandb_name
-    if wandb_run_id:
-        config["wandb_run_id"] = wandb_run_id
-    if wandb_mode:
-        config["wandb_mode"] = wandb_mode
-    if wandb_watch:
-        config["wandb_watch"] = wandb_watch
-    if wandb_log_model:
-        config["wandb_log_model"] = wandb_log_model
-    if wandb_tags:
-        config["wandb_tags"] = list(wandb_tags)
-
-    return config
-
-
-def add_lora_blocks(
-    cfg: Dict[str, Any],
-    adapter: str,
-    model_key: Optional[str] = None,
-    lora_r: int = 16,
-    lora_alpha: int = 16,
-    lora_dropout: float = 0.05,
-    target_modules: Optional[List[str]] = None,
-) -> None:
-    """Augment the config with LoRA/QLoRA settings.
-
-    Parameters
-    ----------
-    cfg : dict
-        Mutable config being built.
-    adapter : str
-        One of {"lora", "qlora"}. "full" means no adapters.
-    lora_r, lora_alpha, lora_dropout : hyperparameters for PEFT LoRA.
-    target_modules : list[str] | None
-        Which linear modules to adapt. If None, uses model defaults when known.
-    """
-    adapter = adapter.lower()
-    if adapter not in {"lora", "qlora"}:
-        return
-
-    cfg["adapter"] = adapter
-
-    # Quantization choice
-    if adapter == "qlora":
-        cfg.update(
-            {
+        This logic is shared by SFT and GRPO builders.
+        """
+        if self.adapter not in {"lora", "qlora"}:
+            return
+        cfg["adapter"] = self.adapter
+        if self.adapter == "qlora":
+            cfg.update({
                 "load_in_4bit": True,
-                # BitsAndBytes quantization recipe commonly used for QLoRA
                 "bnb_4bit_quant_type": "nf4",
                 "bnb_4bit_use_double_quant": True,
                 "bnb_4bit_compute_dtype": "bfloat16",
-                # Optimizer that pairs well with 4-bit params
                 "optimizer": "paged_adamw_8bit",
-            }
-        )
-    else:  # classic LoRA
-        cfg.update(
-            {
+            })
+        else:
+            cfg.update({
                 "load_in_8bit": True,
                 "optimizer": "adamw_torch",
-            }
-        )
+            })
+        cfg.update({
+            "lora_r": int(self.lora_r),
+            "lora_alpha": int(self.lora_alpha),
+            "lora_dropout": float(self.lora_dropout),
+        })
+        tmods = self.lora_target_modules or mdef.get("lora_target_modules")
+        if tmods:
+            cfg["lora_target_modules"] = list(tmods)
 
-    # LoRA hyperparameters
-    cfg.update(
-        {
-            "lora_r": int(lora_r),
-            "lora_alpha": int(lora_alpha),
-            "lora_dropout": float(lora_dropout),
+    @staticmethod
+    def write_yaml(config: Dict[str, Any], output_path: str) -> None:
+        p = Path(output_path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with p.open("w", encoding="utf-8") as f:
+            yaml.safe_dump(config, f, sort_keys=False, allow_unicode=True)
+
+
+# ---------------------------------------------------------------------------
+# SFT builder
+# ---------------------------------------------------------------------------
+class SFTConfigBuilder(BaseConfigBuilder):
+    """Add SFT-specific dataset fields."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+
+    def build(self) -> Dict[str, Any]:
+        cfg = self.build_base()
+        cfg["datasets"][0].update({
+            "type": "chat_template",
+            "roles_to_train": ["assistant"],
+            "train_on_eos": "turn",
+        })
+        return cfg
+
+
+# ---------------------------------------------------------------------------
+# GRPO builder
+# ---------------------------------------------------------------------------
+class GRPOConfigBuilder(BaseConfigBuilder):
+    """Add RL-specific dataset transform and TRL settings for GRPO."""
+
+    def __init__(self, *args,
+                 trl_num_generations: int = 4,
+                 trl_max_completion_length: int = 256,
+                 trl_reward_funcs: Optional[List[str]] = None,
+                 trl_reward_weights: Optional[List[float]] = None,
+                 trl_use_vllm: Optional[bool] = None,
+                 trl_loss_type: Optional[str] = None,
+                 **kwargs):
+        super().__init__(*args, **kwargs)
+        self.trl_num_generations = trl_num_generations
+        self.trl_max_completion_length = trl_max_completion_length
+        self.trl_reward_funcs = trl_reward_funcs or [
+            "rewards.model_helpfulness_reward",
+            "rewards.think_format_reward",
+        ]
+        self.trl_reward_weights = trl_reward_weights or [1.0, 0.2]
+        self.trl_use_vllm = trl_use_vllm
+        self.trl_loss_type = trl_loss_type  # e.g., "dr_grpo"
+
+    def build(self) -> Dict[str, Any]:
+        cfg = self.build_base()
+        # RL dataset: use a transform that returns {"prompt": ...}
+        cfg["datasets"][0].update({
+            "type": "rewards.messages_to_prompt_transform",
+        })
+        # TRL block
+        trl: Dict[str, Any] = {
+            "rl": "grpo",
+            "num_generations": int(self.trl_num_generations),
+            "max_completion_length": int(self.trl_max_completion_length),
+            "reward_funcs": list(self.trl_reward_funcs),
+            "reward_weights": list(self.trl_reward_weights),
         }
-    )
-
-    # Target modules
-    if target_modules is None:
-        lookup_key = model_key or cfg["base_model"]
-        target_modules = MODEL_DEFAULTS.get(lookup_key, {}).get("lora_target_modules")
-    if target_modules:
-        cfg["lora_target_modules"] = list(target_modules)
+        if self.trl_use_vllm is not None:
+            trl["use_vllm"] = bool(self.trl_use_vllm)
+        if self.trl_loss_type:
+            trl["loss_type"] = self.trl_loss_type
+        cfg["trl"] = trl
+        return cfg
 
 
-def write_yaml(config: Dict[str, Any], output_path: str) -> None:
-    """Serialize the config as YAML with stable key ordering.
+# ---------------------------------------------------------------------------
+# DPO builder
+# ---------------------------------------------------------------------------
+class DPOConfigBuilder(BaseConfigBuilder):
+    """Add preference-learning dataset mapping and TRL params for DPO.
 
-    Parameters
-    ----------
-    config : dict
-        Final Axolotl configuration.
-    output_path : str
-        Path to write the YAML file.
+    Expects a dataset row like:
+      {"system": "...", "instruction": "...", "chosen_response": "...", "rejected_response": "..."}
+    which corresponds to Axolotl's `chatml.argilla` DPO type.
     """
-    path = Path(output_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as f:
-        yaml.safe_dump(config, f, sort_keys=False, allow_unicode=True)
+
+    def __init__(self, *args,
+                 trl_beta: Optional[float] = None,
+                 dpo_use_weighting: Optional[bool] = None,
+                 dpo_use_logits_to_keep: Optional[bool] = None,
+                 dpo_label_smoothing: Optional[float] = None,
+                 dpo_norm_loss: Optional[bool] = None,
+                 dpo_padding_free: Optional[bool] = None,
+                 dpo_generate_during_eval: Optional[bool] = None,
+                 dataset_type: str = "chatml.argilla",
+                 **kwargs):
+        super().__init__(*args, **kwargs)
+        self.trl_beta = trl_beta
+        self.dpo_use_weighting = dpo_use_weighting
+        self.dpo_use_logits_to_keep = dpo_use_logits_to_keep
+        self.dpo_label_smoothing = dpo_label_smoothing
+        self.dpo_norm_loss = dpo_norm_loss
+        self.dpo_padding_free = dpo_padding_free
+        self.dpo_generate_during_eval = dpo_generate_during_eval
+        self.dataset_type = dataset_type
+
+    def build(self) -> Dict[str, Any]:
+        cfg = self.build_base()
+        # Map to the Argilla-style pairwise format per Axolotl RLHF docs
+        cfg["datasets"][0].update({
+            "type": self.dataset_type,
+        })
+        # RL selector
+        cfg["rl"] = "dpo"
+        # TRL block (DPO uses beta)
+        trl: Dict[str, Any] = {}
+        if self.trl_beta is not None:
+            trl["beta"] = float(self.trl_beta)
+        if trl:
+            cfg["trl"] = trl
+        # DPO-specific toggles surfaced by Axolotl
+        if self.dpo_use_weighting is not None:
+            cfg["dpo_use_weighting"] = bool(self.dpo_use_weighting)
+        if self.dpo_use_logits_to_keep is not None:
+            cfg["dpo_use_logits_to_keep"] = bool(self.dpo_use_logits_to_keep)
+        if self.dpo_label_smoothing is not None:
+            cfg["dpo_label_smoothing"] = float(self.dpo_label_smoothing)
+        if self.dpo_norm_loss is not None:
+            cfg["dpo_norm_loss"] = bool(self.dpo_norm_loss)
+        if self.dpo_padding_free is not None:
+            cfg["dpo_padding_free"] = bool(self.dpo_padding_free)
+        if self.dpo_generate_during_eval is not None:
+            cfg["dpo_generate_during_eval"] = bool(self.dpo_generate_during_eval)
+        return cfg
+
+
+# ---------------------------------------------------------------------------
+# CLI
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Generate an Axolotl SFT YAML config.")
-    # Required I/O
-    p.add_argument("--base_model", required=True, help="HF model id or local path")
-    p.add_argument("--dataset_path", required=True, help="Path to JSONL dataset (messages format)")
-    p.add_argument("--output_path", required=True, help="Where to write the YAML config")
+    p = argparse.ArgumentParser(description="Generate Axolotl YAML configs (SFT, DPO, or GRPO).")
+    sub = p.add_subparsers(dest="mode", required=True)
 
-    # Training outputs
-    p.add_argument("--output_dir", default="./outputs/run", help="Axolotl output directory")
-    p.add_argument("--run_name", default=None, help="Optional run name (e.g. for W&B)")
+    # Common args function
+    def add_common(sp: argparse.ArgumentParser):
+        sp.add_argument("--base_model", required=True)
+        sp.add_argument("--dataset_path", required=True)
+        sp.add_argument("--output_path", required=True)
+        sp.add_argument("--output_dir", default="./outputs/run")
+        sp.add_argument("--sequence_len", type=int, default=4096)
+        sp.add_argument("--micro_batch_size", type=int, default=1)
+        sp.add_argument("--gradient_accumulation_steps", type=int, default=1)
+        sp.add_argument("--num_epochs", type=int, default=3)
+        sp.add_argument("--learning_rate", type=float, default=2e-4)
+        sp.add_argument("--warmup_ratio", type=float, default=0.03)
+        sp.add_argument("--val_set_size", type=float, default=0.02)
+        sp.add_argument("--chat_template", default=None)
+        sp.add_argument("--model_key", default=None)
+        sp.add_argument("--resume_from_checkpoint", default=None)
+        sp.add_argument("--auto_resume_from_checkpoints", action="store_true")
+        # W&B
+        sp.add_argument("--wandb_project", default=None)
+        sp.add_argument("--wandb_entity", default=None)
+        sp.add_argument("--wandb_name", default=None)
+        sp.add_argument("--wandb_run_id", default=None)
+        sp.add_argument("--wandb_mode", default=None)
+        sp.add_argument("--wandb_watch", default=None)
+        sp.add_argument("--wandb_log_model", default=None)
+        sp.add_argument("--wandb_tags", default=None, help="comma-separated list")
+        # Adapters (shared)
+        sp.add_argument("--adapter", choices=["full", "lora", "qlora"], default="full")
+        sp.add_argument("--lora_r", type=int, default=16)
+        sp.add_argument("--lora_alpha", type=int, default=16)
+        sp.add_argument("--lora_dropout", type=float, default=0.05)
+        sp.add_argument("--lora_target_modules", default=None,
+                        help="comma-separated list; overrides model defaults")
 
-    # Packing + lengths
-    p.add_argument("--sequence_len", type=int, default=4096, help="Packed sequence length")
+    # SFT subcommand
+    sp_sft = sub.add_parser("sft", help="Generate SFT config")
+    add_common(sp_sft)
 
-    # Batching
-    p.add_argument("--micro_batch_size", type=int, default=1)
-    p.add_argument("--gradient_accumulation_steps", type=int, default=1)
+    # DPO subcommand
+    sp_dpo = sub.add_parser("dpo", help="Generate DPO config")
+    add_common(sp_dpo)
+    sp_dpo.add_argument("--trl_beta", type=float, default=None, help="TRL beta (temperature) for DPO loss")
+    sp_dpo.add_argument("--dpo_use_weighting", action="store_true")
+    sp_dpo.add_argument("--dpo_use_logits_to_keep", action="store_true")
+    sp_dpo.add_argument("--dpo_label_smoothing", type=float, default=None)
+    sp_dpo.add_argument("--dpo_norm_loss", action="store_true")
+    sp_dpo.add_argument("--dpo_padding_free", action="store_true")
+    sp_dpo.add_argument("--dpo_generate_during_eval", action="store_true")
+    sp_dpo.add_argument("--dpo_dataset_type", default="chatml.argilla",
+                        help="One of the DPO types in docs (e.g., chatml.argilla, chatml.intel, chat_template.default, user_defined.default)")
 
-    # Schedule
-    p.add_argument("--num_epochs", type=int, default=3)
-    p.add_argument("--learning_rate", type=float, default=2e-4)
-    p.add_argument("--warmup_ratio", type=float, default=0.03)
-    p.add_argument("--val_set_size", type=float, default=0.02)
-
-    # Adapters
-    p.add_argument(
-        "--adapter",
-        choices=["full", "lora", "qlora"],
-        default="qlora",
-        help="Use full fine-tuning or parameter-efficient adapters",
-    )
-    p.add_argument("--lora_r", type=int, default=16)
-    p.add_argument("--lora_alpha", type=int, default=16)
-    p.add_argument("--lora_dropout", type=float, default=0.05)
-    p.add_argument(
-        "--lora_target_modules",
-        type=str,
-        default=None,
-        help="Comma-separated module names to adapt (overrides model defaults)",
-    )
-
-    # Prompt formatting
-    p.add_argument(
-        "--chat_template",
-        default=None,
-        help="Override chat template (default uses tokenizer_default)",
-    )
-
-    # Model defaults resolution
-    p.add_argument(
-        "--model_key",
-        default=None,
-        help=(
-            "Name of the model whose defaults to apply (e.g., 'Qwen/Qwen3-4B-Instruct-2507'). "
-            "Useful when --base_model is a local path. If omitted, the script will try to infer it."
-        ),
-    )
-
-    # Resume options
-    p.add_argument(
-        "--resume_from_checkpoint",
-        default=None,
-        help="Checkpoint directory to resume from (adds resume_from_checkpoint to YAML)",
-    )
-    p.add_argument(
-        "--auto_resume_from_checkpoints",
-        action="store_true",
-        help="If set and --resume_from_checkpoint is not, auto-resume from latest checkpoint",
-    )
-
-    # Weights & Biases
-    p.add_argument("--wandb_project", default=None, help="W&B project name")
-    p.add_argument("--wandb_entity", default=None, help="W&B entity (team) name")
-    p.add_argument("--wandb_name", default=None, help="W&B run name")
-    p.add_argument("--wandb_run_id", default=None, help="W&B run id (to resume a run)")
-    p.add_argument("--wandb_mode", default=None, help='W&B mode: "online", "offline", or "disabled"')
-    p.add_argument("--wandb_watch", default=None, help="W&B watch setting (e.g., gradients")
-    p.add_argument("--wandb_log_model", default=None, help="W&B log model policy (e.g., true|false|checkpoint)")
-    p.add_argument(
-        "--wandb_tags",
-        default=None,
-        help="Comma-separated W&B tags",
-    )
+    # GRPO subcommand
+    sp_grpo = sub.add_parser("grpo", help="Generate GRPO config")
+    add_common(sp_grpo)
+    sp_grpo.add_argument("--trl_num_generations", type=int, default=4)
+    sp_grpo.add_argument("--trl_max_completion_length", type=int, default=256)
+    sp_grpo.add_argument("--trl_reward_funcs", default=None,
+                         help="comma-separated import paths to reward functions")
+    sp_grpo.add_argument("--trl_reward_weights", default=None,
+                         help="comma-separated floats, one per reward func")
+    sp_grpo.add_argument("--trl_use_vllm", action="store_true")
+    sp_grpo.add_argument("--trl_loss_type", default=None, help="e.g., dr_grpo")
 
     return p.parse_args()
 
@@ -419,12 +487,9 @@ def main() -> None:
     args = parse_args()
 
     model_key = resolve_model_key(args.base_model, args.model_key)
+    wandb_tags = [t.strip() for t in args.wandb_tags.split(",")] if args.wandb_tags else None
 
-    tags_list = None
-    if args.wandb_tags:
-        tags_list = [t.strip() for t in args.wandb_tags.split(",") if t.strip()]
-
-    cfg = build_base_config(
+    common_kw = dict(
         base_model=args.base_model,
         dataset_path=args.dataset_path,
         output_dir=args.output_dir,
@@ -435,11 +500,10 @@ def main() -> None:
         learning_rate=args.learning_rate,
         warmup_ratio=args.warmup_ratio,
         val_set_size=args.val_set_size,
-        run_name=args.run_name,
         chat_template=args.chat_template,
         model_key=model_key,
         resume_from_checkpoint=args.resume_from_checkpoint,
-        auto_resume_from_checkpoints=args.auto_resume_from_checkpoints,
+        auto_resume_from_checkpoints=getattr(args, "auto_resume_from_checkpoints", False),
         wandb_project=args.wandb_project,
         wandb_entity=args.wandb_entity,
         wandb_name=args.wandb_name,
@@ -447,24 +511,49 @@ def main() -> None:
         wandb_mode=args.wandb_mode,
         wandb_watch=args.wandb_watch,
         wandb_log_model=args.wandb_log_model,
-        wandb_tags=tags_list,
-    )
-
-    target_modules = None
-    if args.lora_target_modules:
-        target_modules = [x.strip() for x in args.lora_target_modules.split(",") if x.strip()]
-
-    add_lora_blocks(
-        cfg,
+        wandb_tags=wandb_tags,
         adapter=args.adapter,
-        model_key=model_key,
         lora_r=args.lora_r,
         lora_alpha=args.lora_alpha,
         lora_dropout=args.lora_dropout,
-        target_modules=target_modules,
+        lora_target_modules=[x.strip() for x in args.lora_target_modules.split(",")] if getattr(args, "lora_target_modules", None) else None,
     )
 
-    write_yaml(cfg, args.output_path)
+    if args.mode == "sft":
+        builder = SFTConfigBuilder(**common_kw)
+        cfg = builder.build()
+    elif args.mode == "dpo":
+        builder = DPOConfigBuilder(
+            **common_kw,
+            trl_beta=getattr(args, "trl_beta", None),
+            dpo_use_weighting=getattr(args, "dpo_use_weighting", None),
+            dpo_use_logits_to_keep=getattr(args, "dpo_use_logits_to_keep", None),
+            dpo_label_smoothing=getattr(args, "dpo_label_smoothing", None),
+            dpo_norm_loss=getattr(args, "dpo_norm_loss", None),
+            dpo_padding_free=getattr(args, "dpo_padding_free", None),
+            dpo_generate_during_eval=getattr(args, "dpo_generate_during_eval", None),
+            dataset_type=getattr(args, "dpo_dataset_type", "chatml.argilla"),
+        )
+        cfg = builder.build()
+    else:  # grpo
+        reward_funcs = None
+        reward_weights = None
+        if args.trl_reward_funcs:
+            reward_funcs = [x.strip() for x in args.trl_reward_funcs.split(",") if x.strip()]
+        if args.trl_reward_weights:
+            reward_weights = [float(x.strip()) for x in args.trl_reward_weights.split(",") if x.strip()]
+        builder = GRPOConfigBuilder(
+            **common_kw,
+            trl_num_generations=args.trl_num_generations,
+            trl_max_completion_length=args.trl_max_completion_length,
+            trl_reward_funcs=reward_funcs,
+            trl_reward_weights=reward_weights,
+            trl_use_vllm=getattr(args, "trl_use_vllm", False),
+            trl_loss_type=args.trl_loss_type,
+        )
+        cfg = builder.build()
+
+    BaseConfigBuilder.write_yaml(cfg, args.output_path)
     print(f"Wrote Axolotl config to {args.output_path}")
 
 
