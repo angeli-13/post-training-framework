@@ -33,6 +33,7 @@ import re
 from typing import Any, Dict, List, Tuple, Union
 
 import torch
+from functools import lru_cache
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
 try:
@@ -159,11 +160,19 @@ def _load_rm() -> Tuple[AutoTokenizer, AutoModelForSequenceClassification]:
     """Load the reward model and tokenizer lazily as singletons."""
     global _TOKENIZER, _RM
     if _TOKENIZER is None:
-        _TOKENIZER = AutoTokenizer.from_pretrained(_RM_ID, use_fast=True)
+        _TOKENIZER = AutoTokenizer.from_pretrained(_RM_ID, use_fast=True, trust_remote_code=True)
+    # Ensure padding exists for batched scoring
+    if _TOKENIZER.pad_token is None:
+        _TOKENIZER.pad_token = _TOKENIZER.eos_token or _TOKENIZER.sep_token or "<|endoftext|>"
+    _TOKENIZER.padding_side = "right"
+
     if _RM is None:
         _RM = AutoModelForSequenceClassification.from_pretrained(
-            _RM_ID, torch_dtype=_RM_DTYPE, device_map=_RM_DEVICE_MAP
+            _RM_ID, torch_dtype=_RM_DTYPE, device_map=_RM_DEVICE_MAP, trust_remote_code=True
         ).eval()
+
+    # Mirror tokenizer pad id on the model to satisfy Transformers when batching
+    _RM.config.pad_token_id = _TOKENIZER.pad_token_id
     return _TOKENIZER, _RM
 
 

@@ -230,6 +230,7 @@ class BaseConfigBuilder:
             "gradient_checkpointing": True,
             "gradient_checkpointing_kwargs": {"use_reentrant": False},
             "bf16": True,
+            "use_cache": False,
             "output_dir": self.output_dir,
         }
         # Attach model-specific special tokens when known
