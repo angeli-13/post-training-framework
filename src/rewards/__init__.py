@@ -270,13 +270,15 @@ def think_format_reward(
     """Reward that checks for `<think>...</think>` followed by a final answer."""
     if _trl_think_format_reward is None:
         raise ValueError("think_format_reward requires TRL >=0.9")
-    texts: List[str] = []
+    # TRL expects: completions = List[List[{"content": str}]]
+    trl_completions: List[List[Dict[str, str]]] = []
     for c in completions:
-        if isinstance(c, list) and c:
-            texts.append(c[0].get("content", ""))
+        if isinstance(c, list) and c and isinstance(c[0], dict) and "content" in c[0]:
+            trl_completions.append([{"content": c[0]["content"]}])
         else:
-            texts.append(str(c) if c is not None else "")
-    return [float(x) for x in _trl_think_format_reward(completions=texts, **kwargs)]
+            text = str(c) if c is not None else ""
+            trl_completions.append([{"content": text}])
+    return [float(x) for x in _trl_think_format_reward(completions=trl_completions, **kwargs)]
 
 
 __all__ = [
