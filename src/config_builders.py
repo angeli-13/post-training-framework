@@ -153,7 +153,6 @@ class BaseConfigBuilder:
         gradient_accumulation_steps: int = 1,
         num_epochs: int = 3,
         learning_rate: float = 2e-4,
-        warmup_ratio: float = 0.03,
         val_set_size: float = 0.02,
         run_name: Optional[str] = None,
         chat_template: Optional[str] = None,
@@ -184,7 +183,6 @@ class BaseConfigBuilder:
         self.gradient_accumulation_steps = gradient_accumulation_steps
         self.num_epochs = num_epochs
         self.learning_rate = learning_rate
-        self.warmup_ratio = warmup_ratio
         self.val_set_size = val_set_size
         self.run_name = run_name
         self.chat_template = chat_template
@@ -229,7 +227,6 @@ class BaseConfigBuilder:
             "num_epochs": self.num_epochs,
             "learning_rate": self.learning_rate,
             "lr_scheduler": "cosine",
-            "warmup_ratio": self.warmup_ratio,
             "gradient_checkpointing": True,
             "gradient_checkpointing_kwargs": {"use_reentrant": False},
             "bf16": True,
@@ -545,7 +542,6 @@ def parse_args() -> argparse.Namespace:
         sp.add_argument("--gradient_accumulation_steps", type=int, default=1)
         sp.add_argument("--num_epochs", type=int, default=3)
         sp.add_argument("--learning_rate", type=float, default=2e-4)
-        sp.add_argument("--warmup_ratio", type=float, default=0.03)
         sp.add_argument("--val_set_size", type=float, default=0.02)
         sp.add_argument("--chat_template", default=None)
         sp.add_argument("--model_key", default=None)
@@ -644,7 +640,6 @@ def main() -> None:
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         num_epochs=args.num_epochs,
         learning_rate=args.learning_rate,
-        warmup_ratio=args.warmup_ratio,
         val_set_size=args.val_set_size,
         chat_template=args.chat_template,
         model_key=model_key,
