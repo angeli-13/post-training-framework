@@ -353,9 +353,10 @@ class GRPOConfigBuilder(BaseConfigBuilder):
         cfg["datasets"][0].update({
             "type": "rewards.messages_to_prompt_transform",
         })
-        # TRL block
+        # Top-level RL selector (required by Axolotl)
+        cfg["rl"] = "grpo"
+        # TRL block (no 'rl' key inside)
         trl: Dict[str, Any] = {
-            "rl": "grpo",
             "num_generations": int(self.trl_num_generations),
             "max_completion_length": int(self.trl_max_completion_length),
             "reward_funcs": list(self.trl_reward_funcs),
