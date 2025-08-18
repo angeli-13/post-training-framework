@@ -159,6 +159,7 @@ class BaseConfigBuilder:
         model_key: Optional[str] = None,
         resume_from_checkpoint: Optional[str] = None,
         auto_resume_from_checkpoints: Optional[bool] = None,
+        logging_steps: int = 2,
         # W&B
         wandb_project: Optional[str] = None,
         wandb_entity: Optional[str] = None,
@@ -189,6 +190,7 @@ class BaseConfigBuilder:
         self.model_key = model_key
         self.resume_from_checkpoint = resume_from_checkpoint
         self.auto_resume_from_checkpoints = auto_resume_from_checkpoints
+        self.logging_steps = logging_steps
         # W&B
         self.wandb_project = wandb_project
         self.wandb_entity = wandb_entity
@@ -230,7 +232,7 @@ class BaseConfigBuilder:
             "gradient_checkpointing": True,
             "gradient_checkpointing_kwargs": {"use_reentrant": False},
             "bf16": True,
-            "use_cache": False,
+            "logging_steps": self.logging_steps,
             "output_dir": self.output_dir,
         }
         # Attach model-specific special tokens when known
@@ -548,6 +550,7 @@ def parse_args() -> argparse.Namespace:
         sp.add_argument("--model_key", default=None)
         sp.add_argument("--resume_from_checkpoint", default=None)
         sp.add_argument("--auto_resume_from_checkpoints", action="store_true")
+        sp.add_argument("--logging_steps", type=int, default=2)
         # W&B
         sp.add_argument("--wandb_project", default=None)
         sp.add_argument("--wandb_entity", default=None)
@@ -646,6 +649,7 @@ def main() -> None:
         model_key=model_key,
         resume_from_checkpoint=args.resume_from_checkpoint,
         auto_resume_from_checkpoints=getattr(args, "auto_resume_from_checkpoints", False),
+        logging_steps=args.logging_steps,
         wandb_project=args.wandb_project,
         wandb_entity=args.wandb_entity,
         wandb_name=args.wandb_name,
