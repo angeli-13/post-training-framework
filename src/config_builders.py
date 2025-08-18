@@ -663,6 +663,7 @@ def main() -> None:
     if args.mode == "sft":
         builder = SFTConfigBuilder(**common_kw)
         cfg = builder.build()
+
     elif args.mode == "dpo":
         builder = DPOConfigBuilder(
             **common_kw,
@@ -676,7 +677,8 @@ def main() -> None:
             dataset_type=getattr(args, "dpo_dataset_type", "chatml.argilla"),
         )
         cfg = builder.build()
-    else:  # grpo
+
+    elif args.mode == "grpo":
         reward_funcs = None
         reward_weights = None
         if args.trl_reward_funcs:
@@ -693,6 +695,40 @@ def main() -> None:
             trl_loss_type=args.trl_loss_type,
         )
         cfg = builder.build()
+
+    elif args.mode == "ppo":
+        ppo_reward_funcs = None
+        ppo_reward_weights = None
+        if getattr(args, "reward_funcs", None):
+            ppo_reward_funcs = [x.strip() for x in args.reward_funcs.split(",") if x.strip()]
+        if getattr(args, "reward_weights", None):
+            ppo_reward_weights = [float(x.strip()) for x in args.reward_weights.split(",") if x.strip()]
+        builder = PPOConfigBuilder(
+            **common_kw,
+            ppo_batch_size=args.ppo_batch_size,
+            ppo_mini_batch_size=args.ppo_mini_batch_size,
+            ppo_epochs=args.ppo_epochs,
+            ppo_learning_rate=args.ppo_learning_rate,
+            ppo_target_kl=args.ppo_target_kl,
+            ppo_kl_penalty=args.ppo_kl_penalty,
+            ppo_cliprange=args.ppo_cliprange,
+            ppo_cliprange_value=args.ppo_cliprange_value,
+            ppo_gradient_accumulation_steps=args.ppo_gradient_accumulation_steps,
+            ppo_seed=args.ppo_seed,
+            ppo_ref_model=args.ppo_ref_model,
+            gen_max_new_tokens=args.gen_max_new_tokens,
+            gen_temperature=args.gen_temperature,
+            gen_top_p=args.gen_top_p,
+            gen_top_k=args.gen_top_k,
+            gen_do_sample=args.gen_do_sample,
+            reward_funcs=ppo_reward_funcs,
+            reward_weights=ppo_reward_weights,
+        )
+        cfg = builder.build()
+
+    else:
+        raise ValueError(f"Unknown algorithm mode: {args.mode}\n"
+                         "Valid modes: sft, dpo, grpo, ppo")
 
     BaseConfigBuilder.write_yaml(cfg, args.output_path)
     print(f"Wrote Axolotl config to {args.output_path}")
