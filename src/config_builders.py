@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Axolotl config generators with shared, composable defaults.
+Axolotl/TRL config generators with shared, composable defaults.
 
 Design
 ------
@@ -11,11 +11,12 @@ Classes
   SFTConfigBuilder    : Adds SFT-specific dataset block.
   DPOConfigBuilder    : Adds preference-training dataset block and TRL params for DPO.
   GRPOConfigBuilder   : Adds RL-specific dataset transform and TRL (GRPO) block.
+  PPOConfigBuilder    : Adds PPO dataset transform (query output), PPO hyperparams, rollout/generation, and rewards.
 
 Why a single file right now?
 - The classes share constants (MODEL_DEFAULTS) and helpers (model-key resolution, YAML writer).
 - Co-locating avoids duplication and keeps field ordering predictable. If this grows, it can be refactored
-  into a small package (builders/base.py, sft.py, dpo.py, grpo.py, common.py) without changing the public CLI.
+  into a small package (builders/base.py, sft.py, dpo.py, grpo.py, ppo.py, common.py) without changing the public CLI.
 
 Usage examples
 --------------
@@ -59,7 +60,27 @@ GRPO:
     --trl_reward_funcs rewards.model_helpfulness_reward,rewards.think_format_reward \
     --trl_reward_weights 1.0,0.2
 
+PPO (YAML consumed by a standalone TRL runner):
+  python config_builders.py ppo \
+    --base_model /work/.../Qwen3-4B-Instruct-2507 \
+    --dataset_path /data/ppo.jsonl \
+    --output_path qwen3_ppo.yml \
+    --output_dir outputs/qwen3-ppo \
+    --sequence_len 4096 \
+    --micro_batch_size 1 \
+    --gradient_accumulation_steps 8 \
+    --ppo_batch_size 64 \
+    --ppo_mini_batch_size 16 \
+    --ppo_epochs 4 \
+    --ppo_learning_rate 5e-6 \
+    --ppo_target_kl 0.1 \
+    --gen_max_new_tokens 256 \
+    --gen_temperature 0.7 \
+    --gen_top_p 0.9 \
+    --reward_funcs rewards.model_helpfulness_reward,rewards.think_format_reward \
+    --reward_weights 1.0,0.2
 """
+
 from __future__ import annotations
 
 import argparse
@@ -407,14 +428,107 @@ class DPOConfigBuilder(BaseConfigBuilder):
         if self.dpo_generate_during_eval is not None:
             cfg["dpo_generate_during_eval"] = bool(self.dpo_generate_during_eval)
         return cfg
+    
+# ---------------------------------------------------------------------------
+# PPO builder
+# ---------------------------------------------------------------------------
+class PPOConfigBuilder(BaseConfigBuilder):
+    def __init__(self, *args,
+                 # PPO hyperparameters
+                 ppo_batch_size: int = 64,
+                 ppo_mini_batch_size: int = 16,
+                 ppo_epochs: int = 4,
+                 ppo_learning_rate: float = 5e-6,
+                 ppo_target_kl: float = 0.1,
+                 ppo_kl_penalty: str = "kl",
+                 ppo_cliprange: float = 0.2,
+                 ppo_cliprange_value: float = 0.2,
+                 ppo_gradient_accumulation_steps: int | None = None,
+                 ppo_seed: int | None = 42,
+                 ppo_ref_model: str | None = None,
+                 # Generation parameters
+                 gen_max_new_tokens: int = 256,
+                 gen_temperature: float = 0.7,
+                 gen_top_p: float = 0.9,
+                 gen_top_k: int | None = None,
+                 gen_do_sample: bool = True,
+                 # Rewards
+                 reward_funcs: list[str] | None = None,
+                 reward_weights: list[float] | None = None,
+                 **kwargs):
+        super().__init__(*args, **kwargs)
+        # PPO
+        self.ppo_batch_size = ppo_batch_size
+        self.ppo_mini_batch_size = ppo_mini_batch_size
+        self.ppo_epochs = ppo_epochs
+        self.ppo_learning_rate = ppo_learning_rate
+        self.ppo_target_kl = ppo_target_kl
+        self.ppo_kl_penalty = ppo_kl_penalty
+        self.ppo_cliprange = ppo_cliprange
+        self.ppo_cliprange_value = ppo_cliprange_value
+        self.ppo_gradient_accumulation_steps = ppo_gradient_accumulation_steps
+        self.ppo_seed = ppo_seed
+        self.ppo_ref_model = ppo_ref_model
+        # Generation
+        self.gen_max_new_tokens = gen_max_new_tokens
+        self.gen_temperature = gen_temperature
+        self.gen_top_p = gen_top_p
+        self.gen_top_k = gen_top_k
+        self.gen_do_sample = gen_do_sample
+        # Rewards
+        self.reward_funcs = reward_funcs or [
+            "rewards.model_helpfulness_reward",
+            "rewards.think_format_reward",
+        ]
+        self.reward_weights = reward_weights or [1.0, 0.2]
 
+    def build(self) -> Dict[str, Any]:
+        cfg = self.build_base()
+        # PPO dataset transform: emit {"query": ...}
+        cfg["datasets"] = [{
+            "path": self.dataset_path,
+            "type": "rewards.messages_to_query_transform",
+            "ppo": True
+        }]
+
+        cfg["ppo"] = {
+            "batch_size": int(self.ppo_batch_size),
+            "mini_batch_size": int(self.ppo_mini_batch_size),
+            "ppo_epochs": int(self.ppo_epochs),
+            "learning_rate": float(self.ppo_learning_rate),
+            "target_kl": float(self.ppo_target_kl),
+            "kl_penalty": str(self.ppo_kl_penalty),
+            "cliprange": float(self.ppo_cliprange),
+            "cliprange_value": float(self.ppo_cliprange_value),
+            "gradient_accumulation_steps": int(self.ppo_gradient_accumulation_steps
+                                               if self.ppo_gradient_accumulation_steps is not None
+                                               else self.gradient_accumulation_steps),
+            "seed": self.ppo_seed,
+            "ref_model": self.ppo_ref_model,
+        }
+
+        cfg["generate"] = {
+            "max_new_tokens": int(self.gen_max_new_tokens),
+            "temperature": float(self.gen_temperature),
+            "top_p": float(self.gen_top_p),
+            "top_k": (None if self.gen_top_k is None else int(self.gen_top_k)),
+            "do_sample": bool(self.gen_do_sample),
+        }
+
+        cfg["rewards"] = {
+            "reward_funcs": list(self.reward_funcs),
+            "reward_weights": [float(w) for w in self.reward_weights],
+        }
+
+        cfg["output_dir"] = self.output_dir
+        return cfg
 
 # ---------------------------------------------------------------------------
 # CLI
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Generate Axolotl YAML configs (SFT, DPO, or GRPO).")
+    p = argparse.ArgumentParser(description="Generate Axolotl/TRL YAML configs (SFT, DPO, GRPO, PPO).")
     sub = p.add_subparsers(dest="mode", required=True)
 
     # Common args function
@@ -479,6 +593,35 @@ def parse_args() -> argparse.Namespace:
                          help="comma-separated floats, one per reward func")
     sp_grpo.add_argument("--trl_use_vllm", action="store_true")
     sp_grpo.add_argument("--trl_loss_type", default=None, help="e.g., dr_grpo")
+
+    # PPO subcommand (YAML consumed by standalone TRL runner)
+    sp_ppo = sub.add_parser("ppo", help="Generate PPO config for TRL runner")
+    add_common(sp_ppo)
+    # PPO hyperparameters
+    sp_ppo.add_argument("--ppo_batch_size", type=int, default=64)
+    sp_ppo.add_argument("--ppo_mini_batch_size", type=int, default=16)
+    sp_ppo.add_argument("--ppo_epochs", type=int, default=4)
+    sp_ppo.add_argument("--ppo_learning_rate", type=float, default=5e-6)
+    sp_ppo.add_argument("--ppo_target_kl", type=float, default=0.1)
+    sp_ppo.add_argument("--ppo_kl_penalty", default="kl")
+    sp_ppo.add_argument("--ppo_cliprange", type=float, default=0.2)
+    sp_ppo.add_argument("--ppo_cliprange_value", type=float, default=0.2)
+    sp_ppo.add_argument("--ppo_gradient_accumulation_steps", type=int, default=None)
+    sp_ppo.add_argument("--ppo_seed", type=int, default=42)
+    sp_ppo.add_argument("--ppo_ref_model", default=None)
+    # Generation
+    sp_ppo.add_argument("--gen_max_new_tokens", type=int, default=256)
+    sp_ppo.add_argument("--gen_temperature", type=float, default=0.7)
+    sp_ppo.add_argument("--gen_top_p", type=float, default=0.9)
+    sp_ppo.add_argument("--gen_top_k", type=int, default=None)
+    sp_ppo.add_argument("--gen_do_sample", dest="gen_do_sample", action="store_true")
+    sp_ppo.add_argument("--no_gen_do_sample", dest="gen_do_sample", action="store_false")
+    sp_ppo.set_defaults(gen_do_sample=True)
+    # Rewards
+    sp_ppo.add_argument("--reward_funcs", default=None,
+                        help="comma-separated import paths to reward functions")
+    sp_ppo.add_argument("--reward_weights", default=None,
+                        help="comma-separated floats, one per reward func")
 
     return p.parse_args()
 

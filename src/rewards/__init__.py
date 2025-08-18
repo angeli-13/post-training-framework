@@ -7,6 +7,7 @@ Currently implemented rewards:
 
 Dataset transforms:
   - messages_to_prompt_transform: converts {"messages": [...]} rows into a single `prompt` field
+  - messages_to_query_transform : same as above, but emits `{"query": ...}` when PPO usage is desired
 
 Notes
 -----
@@ -70,14 +71,14 @@ _THINK_RE = re.compile(r"<think>.*?</think>\s*", flags=re.DOTALL)
 
 
 # ============================================================================
-# Dataset Transform
+# Dataset Transforms
 # ============================================================================
 
 def messages_to_prompt_transform(cfg: Any, *args: Any, **kwargs: Any) -> Tuple[Any, Dict[str, Any]]:
     """Create a transform that converts `messages` → `prompt` for RL trainers.
 
     The returned callable has signature: `transform_fn(example, tokenizer=None) -> dict`.
-    Axolotl will call it on each dataset row. We:
+    Axolotl or external runners will call it on each dataset row. We:
       1) Drop any assistant turns from `messages` so the policy generates them on-policy
       2) Apply the tokenizer's chat template if provided, emitting a single string prompt
          that ends at the assistant header (add_generation_prompt=True)
@@ -88,7 +89,6 @@ def messages_to_prompt_transform(cfg: Any, *args: Any, **kwargs: Any) -> Tuple[A
     transform_fn : callable(example: dict, tokenizer: Optional[PreTrainedTokenizer]) -> dict
     dataset_kwargs : dict with optional keys like {"remove_columns": ["messages"]}
     """
-
     passthrough_keys = (
         "answer_key",
         "reference_solution",
@@ -99,10 +99,8 @@ def messages_to_prompt_transform(cfg: Any, *args: Any, **kwargs: Any) -> Tuple[A
 
     def transform_fn(example: JSONLike, tokenizer=None) -> JSONLike:
         msgs: Messages = example.get("messages", []) or []
-        # Keep all non-assistant turns (system, user, tool, etc.)
         pruned: Messages = [m for m in msgs if m.get("role") != "assistant"]
 
-        # Materialize a string prompt if tokenizer is available; otherwise keep as messages
         if tokenizer is not None and hasattr(tokenizer, "apply_chat_template"):
             prompt_text = tokenizer.apply_chat_template(
                 pruned,
@@ -114,15 +112,43 @@ def messages_to_prompt_transform(cfg: Any, *args: Any, **kwargs: Any) -> Tuple[A
             out_prompt = pruned  # conversational fallback
 
         out: JSONLike = {"prompt": out_prompt}
-
-        # Pass through a subset of metadata fields your rewards may use
         for k in passthrough_keys:
             if k in example:
                 out[k] = example[k]
         return out
 
-    # Remove the heavy `messages` field after transform to save memory
     return transform_fn, {"remove_columns": ["messages"]}
+
+
+def messages_to_query_transform(cfg: Any,
+                                ppo: bool = True,
+                                return_field: str | None = None,
+                                remove_columns: List[str] | None = None
+                                ) -> Tuple[Any, Dict[str, Any]]:
+    """Create a transform that converts `messages` → `query` (for PPO) or `prompt`.
+
+    Parameters
+    ----------
+    ppo : bool
+        If True, output `{"query": ...}`. If False, behave like messages_to_prompt_transform().
+    return_field : Optional[str]
+        Override the output field name; if provided, ignores `ppo`.
+    remove_columns : Optional[List[str]]
+        Columns to drop after transform (default: ["messages"]).
+    """
+    if remove_columns is None:
+        remove_columns = ["messages"]
+
+    base_tf, _ = messages_to_prompt_transform(cfg)
+
+    def transform_fn(example: JSONLike, tokenizer=None) -> JSONLike:
+        out = base_tf(example, tokenizer=tokenizer)
+        field = return_field if return_field is not None else ("query" if ppo else "prompt")
+        if field == "prompt":
+            return out
+        # rename prompt → query
+        return {"query": out.get("prompt")}
+    return transform_fn, {"remove_columns": list(remove_columns)}
 
 
 # ============================================================================
@@ -130,12 +156,7 @@ def messages_to_prompt_transform(cfg: Any, *args: Any, **kwargs: Any) -> Tuple[A
 # ============================================================================
 
 def _load_rm() -> Tuple[AutoTokenizer, AutoModelForSequenceClassification]:
-    """Load the reward model and tokenizer lazily as singletons.
-
-    The reward model is expected to be a sequence classification head that
-    outputs a single score per input (logit). Any HF checkpoint following this
-    convention should work (e.g., Nemotron-*Reward models).
-    """
+    """Load the reward model and tokenizer lazily as singletons."""
     global _TOKENIZER, _RM
     if _TOKENIZER is None:
         _TOKENIZER = AutoTokenizer.from_pretrained(_RM_ID, use_fast=True)
@@ -153,14 +174,12 @@ def _extract_user_text_from_prompt(prompt: Union[str, Messages]) -> str:
     for msg in reversed(prompt):
         if msg.get("role") == "user":
             return msg.get("content", "")
-    # Fallback: concatenate
     return " ".join(m.get("content", "") for m in prompt)
 
 
 def _normalize_completion_text(completion: Union[str, Messages]) -> str:
     """Return a plain string answer from the completion, stripping <think> blocks."""
     if isinstance(completion, list) and completion:
-        # TRL conversational completions: first turn is assistant
         text = completion[0].get("content", "")
     else:
         text = completion or ""
@@ -174,37 +193,29 @@ def model_helpfulness_reward(
 ) -> List[float]:
     """Model-based helpfulness reward scored by a HF reward model.
 
-    The exact checkpoint is selected by the RM_ID environment variable. The function
-    builds a two-message conversation (user → assistant) per sample and feeds it to the
-    reward model. By default we use the "nothink" recipe:
+    Uses the RM_ID checkpoint. Builds a two-message conversation per sample and feeds it
+    to the reward model. By default uses the "nothink" recipe:
       - append " /nothink" to the user query
       - prepend an empty `<think>\n\n</think>\n\n` block to the assistant answer
-
-    Returns a list of floats (one per completion).
     """
     tok, rm = _load_rm()
 
-    # Build message pairs per sample
     batch_messages: List[Messages] = []
     for p, c in zip(prompts, completions):
         user_text = _extract_user_text_from_prompt(p)
         ans_text = _normalize_completion_text(c)
-
         if _RM_FORMAT == "nothink":
             user_text = f"{user_text} /nothink"
             ans_text = "<think>\n\n</think>\n\n" + ans_text
-
         batch_messages.append([
             {"role": "user", "content": user_text},
             {"role": "assistant", "content": ans_text},
         ])
 
-    # Batched scoring
     scores: List[float] = []
     bs = max(1, _RM_BATCH_SIZE)
     for i in range(0, len(batch_messages), bs):
-        chunk = batch_messages[i : i + bs]
-        # Use chat template if available; otherwise fallback to simple join
+        chunk = batch_messages[i: i + bs]
         if hasattr(tok, "apply_chat_template"):
             toks = tok.apply_chat_template(
                 chunk,
@@ -218,10 +229,8 @@ def model_helpfulness_reward(
             input_ids = toks["input_ids"].to(rm.device)
             attn = toks.get("attention_mask")
             attn = attn.to(rm.device) if attn is not None else None
-        else:  # very generic fallback
-            texts = [
-                f"User: {m[0]['content']}\nAssistant: {m[1]['content']}" for m in chunk
-            ]
+        else:
+            texts = [f"User: {m[0]['content']}\nAssistant: {m[1]['content']}" for m in chunk]
             toks = tok(texts, return_tensors="pt", padding=True, truncation=True)
             input_ids = toks["input_ids"].to(rm.device)
             attn = toks.get("attention_mask")
@@ -230,16 +239,13 @@ def model_helpfulness_reward(
         with torch.no_grad():
             logits = rm(input_ids=input_ids, attention_mask=attn).logits
 
-        # Convert to 1D scores robustly
         if logits.ndim == 2 and logits.size(-1) == 1:
             chunk_scores = logits.squeeze(-1)
         elif logits.ndim == 1:
             chunk_scores = logits
         else:
-            # Fallback: take the last logit as a scalar score
             chunk_scores = logits[..., -1]
         scores.extend([float(x) for x in chunk_scores.detach().cpu().tolist()])
-
     return scores
 
 
@@ -252,28 +258,21 @@ def think_format_reward(
     completions: List[Union[str, Messages]],
     **kwargs: Any,
 ) -> List[float]:
-    """Reward that checks for `<think>...</think>` followed by a final answer.
-
-    This is a thin wrapper around `trl.rewards.think_format_reward`. If TRL's
-    helper is unavailable in your environment, this raises an error.
-    """
+    """Reward that checks for `<think>...</think>` followed by a final answer."""
     if _trl_think_format_reward is None:
         raise ValueError("think_format_reward requires TRL >=0.9")
-
-    # TRL's function expects raw completion texts; normalize completions to strings
     texts: List[str] = []
     for c in completions:
         if isinstance(c, list) and c:
             texts.append(c[0].get("content", ""))
         else:
             texts.append(str(c) if c is not None else "")
-
     return [float(x) for x in _trl_think_format_reward(completions=texts, **kwargs)]
 
 
-# Public API
 __all__ = [
     "messages_to_prompt_transform",
+    "messages_to_query_transform",
     "model_helpfulness_reward",
     "think_format_reward",
 ]
