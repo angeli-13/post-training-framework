@@ -1,110 +1,141 @@
 #!/bin/bash
 #SBATCH --partition=hhai
 #SBATCH --nodes=1
-#SBATCH --gpus-per-node=1
+#SBATCH --gpus-per-node=6
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=12
 #SBATCH --time=1:30:00
 #SBATCH --mem=200G
-#SBATCH --job-name=grpo_qwen3_full_single
-#SBATCH --output=grpo_qwen3_full_%j.out
-#SBATCH --error=grpo_qwen3_full_%j.err
+#SBATCH --job-name=grpo_combo
+#SBATCH --output=grpo_%j.out
+#SBATCH --error=grpo_%j.err
 
 set -euo pipefail
 
 # =========================
-# USER CONFIG
+# Arg parsing
 # =========================
-BASE_MODEL="/work/HHRI-AI/POC/public/pretraining_weights/Alibaba-Qwen/qwen3/Qwen3-4B-Instruct-2507"
-GRPO_DATA="/work/HHRI-AI/POC/angela/post-training-framework/data/chunk1-merged.jsonl"
-WORK_DIR="/work/HHRI-AI/POC/angela/post-training-framework"   # repo root containing src/
-RUNS_DIR="${WORK_DIR}/runs"
-WANDB_PROJECT="hhri-foxbrain"
+CFG=""
+WORK_DIR=""
+RUNS_DIR=""
+RUN_ID=""
+PORT="8000"
+SERVER_GPUS="2,3"
+TRAIN_GPUS="0,1"
+NUM_PROCESSES="2"
 
-# Reward model for model_helpfulness_reward (can be overridden per-job)
-export RM_ID="nvidia/Qwen-3-Nemotron-32B-Reward"
-export RM_DEVICE_MAP="auto"
-export RM_DTYPE="bf16"    # or fp16/fp32
-export RM_BATCH_SIZE="2"
-export RM_FORMAT="nothink"
+usage() {
+  cat <<EOF
+Usage (sbatch args after script name):
+  grpo_job.sh --cfg PATH --work_dir PATH --runs_dir PATH --run_id ID
+              [--port PORT] [--server_gpus LIST] [--train_gpus LIST] [--num_processes N]
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --cfg)            CFG="$2"; shift 2;;
+    --work_dir)       WORK_DIR="$2"; shift 2;;
+    --runs_dir)       RUNS_DIR="$2"; shift 2;;
+    --run_id)         RUN_ID="$2"; shift 2;;
+    --port)           PORT="$2"; shift 2;;
+    --server_gpus)    SERVER_GPUS="$2"; shift 2;;
+    --train_gpus)     TRAIN_GPUS="$2"; shift 2;;
+    --num_processes)  NUM_PROCESSES="$2"; shift 2;;
+    -h|--help)        usage; exit 0;;
+    *) echo "Unknown arg: $1"; usage; exit 1;;
+  esac
+done
+
+if [[ -z "${CFG}" || -z "${WORK_DIR}" || -z "${RUNS_DIR}" || -z "${RUN_ID}" ]]; then
+  echo "Missing required arguments."; usage; exit 1
+fi
+
+RUN_DIR="${RUNS_DIR}/${RUN_ID}"
+mkdir -p "${RUN_DIR}"
 
 # =========================
 # Environment
 # =========================
 module load cuda/12.2
 
-# Conda
 source /work/HHRI-AI/anaconda/etc/profile.d/conda.sh
-conda activate axolotl-angela
+conda activate axolotl
 
-# Make local src/ importable so "rewards.*" resolves
 export PYTHONPATH="${WORK_DIR}/src:${PYTHONPATH:-}"
-
-# Optional caches (safe to remove)
-# export HF_HOME="/work/HHRI-AI/.hf"
-# export TRANSFORMERS_CACHE="$HF_HOME/transformers"
-# export HF_DATASETS_CACHE="$HF_HOME/datasets"
 export TOKENIZERS_PARALLELISM=false
 export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-12}"
+export TRANSFORMERS_VERBOSITY=error
+
+# Reward-model env
+export RM_ID="/work/HHRI-AI/POC/public/pretraining_weights/Alibaba-Qwen/qwen3/Qwen-3-Nemotron-32B-Reward"
+export RM_DEVICE_MAP="auto"
+export RM_DTYPE="bf16"
+export RM_BATCH_SIZE="4"
+export RM_FORMAT="nothink"
 
 # =========================
-# Paths and logging
+# Logging
 # =========================
-JOB_OUT="${RUNS_DIR}/qwen3_grpo_${SLURM_JOB_ID}"
-MERGED_CFG="${JOB_OUT}/${SLURM_JOB_ID}.yaml"
+JOB_OUT="${RUN_DIR}/combo_${SLURM_JOB_ID}"
 mkdir -p "$JOB_OUT"
-
-# Save full logs inside JOB_OUT (in addition to Slurm logs)
 RUN_LOG="$JOB_OUT/run.log"
 ERR_LOG="$JOB_OUT/run.err"
-exec > >(tee -a "$RUN_LOG") 2> >(tee -a "$ERR_LOG" >&2)
+exec > >(tee -a "$RUN_LOG") \
+     2> >(grep -v "Caching is incompatible with gradient checkpointing" | tee -a "$ERR_LOG" >&2)
 
-echo "=== Job $SLURM_JOB_ID starting at $(date) ==="
+echo "=== Combo job $SLURM_JOB_ID starting at $(date) ==="
 echo "Node(s): $SLURM_JOB_NODELIST"
-echo "Conda env: $(conda info --envs | grep '*' || true)"
-echo "axolotl path: $(command -v axolotl || echo 'not found')"
-echo "PYTHONPATH: $PYTHONPATH"
-echo "Reward model: ${RM_ID}"
+echo "CFG     : $CFG"
+echo "RUN_DIR : $RUN_DIR"
+echo "PORT    : $PORT"
+echo "SERVER_GPUS=${SERVER_GPUS}  TRAIN_GPUS=${TRAIN_GPUS}  NP=${NUM_PROCESSES}"
+echo "axolotl  : $(command -v axolotl || echo 'not found')"
 
 # =========================
-# 1) Emit merged Axolotl YAML (GRPO)
+# Start vLLM server (background) on SERVER_GPUS
 # =========================
-echo "[1/2] Emitting GRPO Axolotl config..."
-python "${WORK_DIR}/src/config_builders.py" grpo \
-  --base_model "$BASE_MODEL" \
-  --dataset_path "$GRPO_DATA" \
-  --output_path "$MERGED_CFG" \
-  --adapter full \
-  --output_dir "$JOB_OUT" \
-  --sequence_len 4096 \
-  --micro_batch_size 1 \
-  --gradient_accumulation_steps 8 \
-  --num_epochs 3 \
-  --trl_num_generations 8 \
-  --trl_max_completion_length 256 \
-  --trl_reward_funcs rewards.model_helpfulness_reward,rewards.think_format_reward \
-  --trl_reward_weights 1.0,0.2 \
-  --wandb_project "$WANDB_PROJECT" \
-  --wandb_name qwen3-grpo-run1
+BASE_URL="http://$(hostname -s):${PORT}"
+echo "[SERVER] Starting vLLM on ${BASE_URL} (CUDA_VISIBLE_DEVICES=${SERVER_GPUS})"
 
-echo "Merged config -> $MERGED_CFG"
-echo "Outputs dir   -> $JOB_OUT"
-
-# =========================
-# 2) Train with Axolotl on the merged config
-# =========================
-echo "[2/2] Training: axolotl train \"$MERGED_CFG\""
 set +e
-axolotl train "$MERGED_CFG"
+CUDA_VISIBLE_DEVICES="${SERVER_GPUS}" axolotl vllm-serve "$CFG" &
+SERVER_PID=$!
 AXO_RC=$?
-
-# Fallback to python module form if CLI entrypoint is problematic
 if [[ $AXO_RC -ne 0 ]]; then
-  echo "axolotl CLI failed (rc=$AXO_RC). Falling back to 'python -m axolotl.cli.train'."
-  python -m axolotl.cli.train "$MERGED_CFG"
+  echo "[SERVER] axolotl CLI failed (rc=$AXO_RC). Falling back to 'python -m axolotl.cli.vllm_serve'."
+  CUDA_VISIBLE_DEVICES="${SERVER_GPUS}" python -m axolotl.cli.vllm_serve "$CFG" &
+  SERVER_PID=$!
+fi
+set -e
+
+trap "echo '[SERVER] Stopping (PID ${SERVER_PID})'; kill ${SERVER_PID}; wait ${SERVER_PID} 2>/dev/null || true" SIGINT SIGTERM EXIT
+
+# =========================
+# Wait 60 seconds (simple approach as requested)
+# =========================
+echo "[SERVER] Sleeping 60s before training..."
+sleep 60
+
+# =========================
+# GRPO training on TRAIN_GPUS
+# =========================
+echo "[TRAIN] Launch on CUDA_VISIBLE_DEVICES=${TRAIN_GPUS}  --num-processes ${NUM_PROCESSES}"
+
+
+echo "[TRAIN] axolotl train \"${CFG}\" --num-processes ${NUM_PROCESSES}"
+set +e
+CUDA_VISIBLE_DEVICES="${TRAIN_GPUS}" axolotl train "${CFG}" --num-processes "${NUM_PROCESSES}"
+AXO_RC=$?
+if [[ $AXO_RC -ne 0 ]]; then
+  echo "[TRAIN] axolotl CLI failed (rc=$AXO_RC). Falling back to 'python -m axolotl.cli.train'."
+  CUDA_VISIBLE_DEVICES="${TRAIN_GPUS}" python -m axolotl.cli.train "${CFG}" --num-processes "${NUM_PROCESSES}"
   AXO_RC=$?
 fi
 set -e
 
-echo "=== Job $SLURM_JOB_ID finished with rc=$AXO_RC at $(date) ==="
+# =========================
+# Done
+# =========================
+echo "=== Combo job $SLURM_JOB_ID finished with rc=$AXO_RC at $(date) ==="
 exit $AXO_RC

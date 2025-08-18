@@ -1,7 +1,7 @@
 #!/bin/bash
 #SBATCH --partition=hhai
 #SBATCH --nodes=1
-#SBATCH --gpus-per-node=1
+#SBATCH --gpus-per-node=4
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=12
 #SBATCH --time=1:00:00
@@ -28,7 +28,7 @@ module load cuda/12.2
 
 # Conda
 source /work/HHRI-AI/anaconda/etc/profile.d/conda.sh
-conda activate axolotl-angela
+conda activate axolotl
 
 # Optional caches (safe to remove)
 # export HF_HOME="/work/HHRI-AI/.hf"
@@ -59,7 +59,7 @@ echo "axolotl path: $(command -v axolotl || echo 'not found')"
 # 1) Emit merged Axolotl YAML
 # =========================
 echo "[1/2] Emitting merged Axolotl config..."
-python "${WORK_DIR}/src/gen_axolotl_config_sft.py" \
+python "${WORK_DIR}/src/config_builders.py" sft \
   --base_model "$BASE_MODEL" \
   --dataset_path "$SFT_DATA" \
   --output_path "$MERGED_CFG" \
