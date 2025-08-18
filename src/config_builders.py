@@ -222,7 +222,6 @@ class BaseConfigBuilder:
             "dataset_prepared_path": "last_run_prepared",
             "val_set_size": self.val_set_size,
             "sequence_len": self.sequence_len,
-            "sample_packing": True,
             "eval_sample_packing": False,
             "pad_to_sequence_len": True,
             "micro_batch_size": self.micro_batch_size,
@@ -314,6 +313,7 @@ class SFTConfigBuilder(BaseConfigBuilder):
 
     def build(self) -> Dict[str, Any]:
         cfg = self.build_base()
+        cfg["sample_packing"] = True
         cfg["datasets"][0].update({
             "type": "chat_template",
             "roles_to_train": ["assistant"],
@@ -349,6 +349,7 @@ class GRPOConfigBuilder(BaseConfigBuilder):
 
     def build(self) -> Dict[str, Any]:
         cfg = self.build_base()
+        cfg["sample_packing"] = False
         # RL dataset: use a transform that returns {"prompt": ...}
         cfg["datasets"][0].update({
             "type": "rewards.messages_to_prompt_transform",
@@ -403,6 +404,7 @@ class DPOConfigBuilder(BaseConfigBuilder):
 
     def build(self) -> Dict[str, Any]:
         cfg = self.build_base()
+        cfg["sample_packing"] = False
         # Map to the Argilla-style pairwise format per Axolotl RLHF docs
         cfg["datasets"][0].update({
             "type": self.dataset_type,
