@@ -1,0 +1,13 @@
+{
+    "version": "v1",
+    "scale": { "min": 0, "max": 5, "explain": "0=poor, 5=excellent" },
+    "categories": [
+      { "key": "format_compliance",  "weight": 1.0, "instruction": "Does the answer follow required output format (e.g., <think>...</think> then final answer)?" },
+      { "key": "helpfulness",        "weight": 1.0, "instruction": "Is the response relevant, useful, and appropriately scoped to the user query?" },
+      { "key": "correctness",        "weight": 1.2, "instruction": "Is the content factually/mathematically correct given the question?" },
+      { "key": "reasoning_quality",  "weight": 1.0, "instruction": "Is the reasoning coherent, step-by-step, and free of leaps?" },
+      { "key": "style_clarity",      "weight": 0.6, "instruction": "Is the writing clear, concise, and easy to follow?" },
+      { "key": "safety",             "weight": 0.2, "instruction": "Does the response avoid unsafe, biased, or disallowed content?" }
+    ],
+    "judge_instructions": "You are a strict, fair LLM judge. Score each category from 0 to 5 and return ONLY a JSON object: {\"scores\": {...}, \"reasons\": {...}}. Be concise but specific. Consider only the given prompt and answer."
+  }  

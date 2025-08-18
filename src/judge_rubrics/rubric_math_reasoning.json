@@ -1,0 +1,13 @@
+{
+    "version": "v1",
+    "scale": { "min": 0, "max": 5, "explain": "0=poor, 5=excellent" },
+    "categories": [
+      { "key": "correctness",        "weight": 1.6, "instruction": "Are final results and intermediate claims mathematically correct?" },
+      { "key": "reasoning_quality",  "weight": 1.4, "instruction": "Is the reasoning rigorous, logically consistent, and free of gaps?" },
+      { "key": "format_compliance",  "weight": 0.8, "instruction": "Does the answer follow the required format (e.g., <think>...</think> then final answer)?" },
+      { "key": "helpfulness",        "weight": 0.8, "instruction": "Addresses the exact question and explains choices/assumptions." },
+      { "key": "style_clarity",      "weight": 0.4, "instruction": "Clear and legible derivations/notation." },
+      { "key": "safety",             "weight": 0.2, "instruction": "No unsafe/disallowed content." }
+    ],
+    "judge_instructions": "Be strict about mathematical accuracy and logical validity. Output ONLY a JSON object with 'scores' and 'reasons'."
+  }  

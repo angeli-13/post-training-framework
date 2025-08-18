@@ -1,0 +1,13 @@
+{
+    "version": "v1",
+    "scale": { "min": 0, "max": 5, "explain": "0=poor, 5=excellent" },
+    "categories": [
+      { "key": "format_compliance",  "weight": 1.5, "instruction": "Does the response strictly follow the specified output format and markers?" },
+      { "key": "style_clarity",      "weight": 1.2, "instruction": "Is the writing organized, concise, and readable?" },
+      { "key": "helpfulness",        "weight": 1.0, "instruction": "Is the content relevant and practically useful?" },
+      { "key": "correctness",        "weight": 0.8, "instruction": "Is the content accurate given the prompt?" },
+      { "key": "reasoning_quality",  "weight": 0.8, "instruction": "Is the reasoning step-by-step and justified?" },
+      { "key": "safety",             "weight": 0.2, "instruction": "Avoid unsafe or disallowed content." }
+    ],
+    "judge_instructions": "Return ONLY JSON with keys 'scores' and 'reasons'. Penalize any deviation from required formatting heavily."
+  }  
