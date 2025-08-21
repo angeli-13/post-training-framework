@@ -1,11 +1,11 @@
 #!/bin/bash
 #SBATCH --partition=hhai
 #SBATCH --nodes=1
-#SBATCH --gpus-per-node=6
+#SBATCH --gpus-per-node=8
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=12
-#SBATCH --time=1:30:00
-#SBATCH --mem=200G
+#SBATCH --cpus-per-task=90
+#SBATCH --time=150:00:00
+#SBATCH --mem=1200G
 #SBATCH --job-name=grpo_combo
 #SBATCH --output=grpo_%j.out
 #SBATCH --error=grpo_%j.err
@@ -20,9 +20,10 @@ WORK_DIR=""
 RUNS_DIR=""
 RUN_ID=""
 PORT="8000"
-SERVER_GPUS="2,3"
-TRAIN_GPUS="0,1"
+SERVER_GPUS="7"
+TRAIN_GPUS="0,1,2,3,4,5,6" #"0,1,2,3,4,5"
 NUM_PROCESSES="2"
+
 
 usage() {
   cat <<EOF
@@ -67,12 +68,36 @@ export TOKENIZERS_PARALLELISM=false
 export OMP_NUM_THREADS="${SLURM_CPUS_PER_TASK:-12}"
 export TRANSFORMERS_VERBOSITY=error
 
+# Mute the warning from numexpr
+export NUMEXPR_MAX_THREADS=512 NUMEXPR_NUM_THREADS=64
+
 # Reward-model env
-export RM_ID="/work/HHRI-AI/POC/public/pretraining_weights/Alibaba-Qwen/qwen3/Qwen-3-Nemotron-32B-Reward"
+export RM_ID="/work/HHRI-AI/POC/public/pretraining_weights/reward_model/Skywork-Reward-Llama-3.1-8B"
 export RM_DEVICE_MAP="auto"
 export RM_DTYPE="bf16"
-export RM_BATCH_SIZE="4"
+export RM_BATCH_SIZE="2"
 export RM_FORMAT="nothink"
+
+=========================
+Cleanup
+=========================
+cleanup_vllm() {
+  set +e
+  echo "[CLEANUP] Terminating any vLLM servers still running..."
+  # common entrypoints TRL/axolotl/vLLM use:
+  pkill -f "vllm.entrypoints.openai.api_server"   || true
+  pkill -f "axolotl.cli.vllm_serve"               || true
+  pkill -f "python -m axolotl.cli.vllm_serve"     || true
+  # give them a moment to exit cleanly, then force if needed
+  sleep 2
+  pgrep -f "vllm.entrypoints.openai.api_server|axolotl.cli.vllm_serve" >/dev/null 2>&1 && {
+    echo "[CLEANUP] Forcing vLLM shutdown..."
+    pkill -9 -f "vllm.entrypoints.openai.api_server" || true
+    pkill -9 -f "axolotl.cli.vllm_serve"             || true
+  }
+  set -e
+}
+trap cleanup_vllm EXIT INT TERM
 
 # =========================
 # Logging
@@ -95,27 +120,27 @@ echo "axolotl  : $(command -v axolotl || echo 'not found')"
 # =========================
 # Start vLLM server (background) on SERVER_GPUS
 # =========================
-BASE_URL="http://$(hostname -s):${PORT}"
-echo "[SERVER] Starting vLLM on ${BASE_URL} (CUDA_VISIBLE_DEVICES=${SERVER_GPUS})"
+# BASE_URL="http://$(hostname -s):${PORT}"
+# echo "[SERVER] Starting vLLM on ${BASE_URL} (CUDA_VISIBLE_DEVICES=${SERVER_GPUS})"
 
-set +e
-CUDA_VISIBLE_DEVICES="${SERVER_GPUS}" axolotl vllm-serve "$CFG" &
-SERVER_PID=$!
-AXO_RC=$?
-if [[ $AXO_RC -ne 0 ]]; then
-  echo "[SERVER] axolotl CLI failed (rc=$AXO_RC). Falling back to 'python -m axolotl.cli.vllm_serve'."
-  CUDA_VISIBLE_DEVICES="${SERVER_GPUS}" python -m axolotl.cli.vllm_serve "$CFG" &
-  SERVER_PID=$!
-fi
-set -e
+# set +e
+# CUDA_VISIBLE_DEVICES="${SERVER_GPUS}" axolotl vllm-serve "$CFG" &
+# SERVER_PID=$!
+# AXO_RC=$?
+# if [[ $AXO_RC -ne 0 ]]; then
+#   echo "[SERVER] axolotl CLI failed (rc=$AXO_RC). Falling back to 'python -m axolotl.cli.vllm_serve'."
+#   CUDA_VISIBLE_DEVICES="${SERVER_GPUS}" python -m axolotl.cli.vllm_serve "$CFG" &
+#   SERVER_PID=$!
+# fi
+# set -e
 
-trap "echo '[SERVER] Stopping (PID ${SERVER_PID})'; kill ${SERVER_PID}; wait ${SERVER_PID} 2>/dev/null || true" SIGINT SIGTERM EXIT
+# trap "echo '[SERVER] Stopping (PID ${SERVER_PID})'; kill ${SERVER_PID}; wait ${SERVER_PID} 2>/dev/null || true" SIGINT SIGTERM EXIT
 
-# =========================
-# Wait 60 seconds (simple approach as requested)
-# =========================
-echo "[SERVER] Sleeping 60s before training..."
-sleep 60
+# # =========================
+# # Wait 60 seconds (simple approach as requested)
+# # =========================
+# echo "[SERVER] Sleeping 60s before training..."
+# sleep 60
 
 # =========================
 # GRPO training on TRAIN_GPUS
@@ -137,5 +162,6 @@ set -e
 # =========================
 # Done
 # =========================
+# cleanup_vllm
 echo "=== Combo job $SLURM_JOB_ID finished with rc=$AXO_RC at $(date) ==="
 exit $AXO_RC

@@ -51,7 +51,8 @@ Messages = List[Dict[str, str]]
 _RM_ID = os.getenv("RM_ID", "nvidia/Qwen-3-Nemotron-32B-Reward")
 _RM_DEVICE_MAP = os.getenv("RM_DEVICE_MAP", "auto")
 _RM_BATCH_SIZE = int(os.getenv("RM_BATCH_SIZE", "2"))
-_RM_FORMAT = os.getenv("RM_FORMAT", "nothink").lower()  # {nothink, plain}
+# _RM_FORMAT = os.getenv("RM_FORMAT", "nothink").lower()  # {nothink, plain}
+_RM_FORMAT_ENV = os.getenv("RM_FORMAT", "auto").lower()  # {auto, plain, nothink}
 
 _dtype_env = os.getenv("RM_DTYPE", "auto").lower()
 if _dtype_env in {"bf16", "bfloat16"}:
@@ -62,6 +63,20 @@ elif _dtype_env in {"fp32", "float32"}:
     _RM_DTYPE = torch.float32
 else:  # auto
     _RM_DTYPE = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+
+# Choose format based on model id unless explicitly set
+_NOTHINK_MODEL_HINTS = (
+    "nemotron",            # NVIDIA Nemotron reward models
+    "qwen-3-nemotron",     # explicit hint for Qwen-3 Nemotron RM
+)
+
+def _resolve_rm_format(rm_id: str, rm_format_env: str) -> str:
+    if rm_format_env in {"plain", "nothink"}:
+        return rm_format_env
+    rid = rm_id.lower()
+    return "nothink" if any(h in rid for h in _NOTHINK_MODEL_HINTS) else "plain"
+
+_RM_FORMAT = _resolve_rm_format(_RM_ID, _RM_FORMAT_ENV)
 
 # Lazy singletons for the reward model
 _TOKENIZER = None
@@ -220,6 +235,7 @@ def model_helpfulness_reward(
             {"role": "user", "content": user_text},
             {"role": "assistant", "content": ans_text},
         ])
+        # else: "plain", no special formatting
 
     scores: List[float] = []
     bs = max(1, _RM_BATCH_SIZE)
